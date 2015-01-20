@@ -1,0 +1,2162 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+btv
+
+this treeviewer does exactly what Eclipse does for me. it gives me a
+treeviewer, but i prefer to open files in editors which are better to
+work with, so files can be opened in any editor (default is xterm+vim).
+
+this application is recursive in some sense, in the way that it tries
+to open directories recursively (if non-recursive has been switched on
+it will open directories recursively for files already loaded into the
+treestore).
+
+since it can be used without loading all contents at once
+(--non-recursive), it can be used for arbitrary sized file-trees.
+
+keyboard control is a good thing and every command should have its own
+key-binding. below is a listing of the key-bindings which can be used
+to control the application.
+
+ Key-bindings:
+
+ Control+L ____________ Open/Collapse TreeView
+ Return / Space _______ Open/Collapse marked directory
+ Return / Space _______ Open file if file is marked
+ Left/Right/Up/Down ___ Scroll Left/Right/Up/Down
+ Control+Q/W __________ Kill
+ Control+C ____________ Are you sure? -> Kill
+ Control+S ____________ Stick/Unstick (visible on all desktops)
+ Control+I ____________ Iconify
+ Control+O ____________ Open file with different program
+ Control+0 ____________ Set TreeView in position (0,0)
+ Control+Plus _________ Make TreeView bigger
+ Control+Minus ________ Make TreeView smaller
+ Control+Down _________ Toggle Open/Collapse (one level)
+ Control+UP ___________ Toggle Open/Collapse (one level)
+ + ____________________ Open one level in TreeView
+ - ____________________ Close one level in TreeView
+ F5 ___________________ Refresh TreeView
+ Control+M ____________ Maximize/Unmaximize TreeView
+ Control+D ____________ Delete marked file
+ Control+R ____________ Rename marked file
+ Control+A ____________ Add new file in marked directory
+ Control+G ____________ Grep for pattern
+ Alt+Plus _____________ Make font of treeview larger
+ Alt+Minus ____________ Make font of treeview smaller
+
+end keybinding
+
+
+------------------------------  Licence  ---------------------------------
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   http://www.gnu.org/licenses/gpl2.txt
+
+--------------------------------------------------------------------------
+
+Special thanks to Lars Storjord (lstor@simula.no) for adding support for
+other terminals (aterm, wterm, rxvt...)
+"""
+# TODO: make filters for 'source code' (*.py *.c *.cpp *.pl *.java..)
+# use gnome-open/xdg-open etc. if filename does not match filter
+
+try:
+    import sys
+    import pygtk
+    pygtk.require("2.0")
+    import gtk
+    import os
+    import re
+    import tempfile
+    import gobject
+    import logging
+    import signal
+    import fnmatch
+except ImportError, inst:
+    print "missing required module"
+    print inst
+    sys.exit(1)  # always available
+except Exception, inst:
+    print "something bad happend"
+    print inst
+    sys.exit(1)  # always available
+
+
+__version__ = "1.1"
+__author__ = "bjarneh@ifi.uio.no"
+
+
+#_____________________________________________________________________________#
+
+
+class TreeViewWindow(gtk.Window):
+    """
+    this class draws up the GUI and works as a listener
+    for all non-key events, also performs the actions
+    (which are mostly flapping the treeview and showing
+    files in a preferred editor/or other program)
+    the KeyboardListener listens to all button-pressing events
+    """
+
+    def __init__(self):
+
+        gtk.Window.__init__(self)
+
+        self.button_listener = KeyboardListener()
+        logo_generator = TreeGFX()
+
+        global _config
+
+        self.recursive = _config['recursive']
+        self.collapsed = 1
+        self.programmatic_expand = 0
+
+        # build string which will be executed once
+        # a file is clicked [treeview path = file path opened]
+        self.exe = self.build_exe(_config['executable'],
+                                  _config['xterm'],
+                                  _config['geometry'],
+                                  _config['exe_args'],
+                                  _config['altterm'],
+                                  _config['termargs'])
+
+        # logos are of extreme importance
+        self.set_icon(logo_generator.get_logo(_config['logo']))
+
+        self.set_title(_config['title'])
+        self.set_geometry_hints(min_width=_config['min_w'],
+                                min_height=_config['min_h'])
+        self.connect("destroy", self.rm_tmp_n_quit)
+
+        # listen to button-pressing but out-source handling to ButtonListener
+        self.add_events(gtk.gdk.BUTTON_PRESS_MASK)
+        self.connect("key-press-event", self.button_listener.button_pressed)
+
+        self.tree = gtk.TreeStore(gobject.TYPE_STRING, gobject.TYPE_STRING)
+
+        # style string markup
+        mystyle = '<span foreground="black" background="orange">%s</span>'
+
+        # build treeview
+        self.treeview = gtk.TreeView()
+        self.refresh(self.tree)
+        # tool tip for entire tree, press Ctrl+H to see shortcuts
+        ttip = "Ctrl+H : shortcuts"
+##         self.treeview.set_tooltip_markup(mystyle%(ttip))
+        self.treeview.set_tooltip_markup(ttip)
+
+        # make the header a "button" which collapses/opens treeview
+        r = gtk.CellRendererText()
+        tctext = "Expand/Collapse (Ctrl+L)"
+        tree_view_column = gtk.TreeViewColumn(tctext, r, text=0)
+        tree_view_column.set_sizing(gtk.TREE_VIEW_COLUMN_AUTOSIZE)
+        tree_view_column.connect("clicked", self.header_click)
+        self.treeview.insert_column(tree_view_column, -1)
+
+        select = self.treeview.get_selection()
+        select.set_mode(gtk.SELECTION_SINGLE)
+        select.unselect_all()
+        self.treeview.set_model(self.tree)
+
+        # listen to row-activated (double-click and Return/Space)
+        # and row-expanded, which makes us fill in files in subdirectories
+        # if none are there in non-recursive mode
+        self.treeview.set_headers_clickable(True)
+        self.treeview.collapse_all()
+        self.treeview.connect('row-activated', self.row_activated)
+        self.treeview.connect('row-expanded', self.row_expanded)
+        self.treeview.show()
+
+        # place treeview inside a scrolled window
+        # the need for this has more or less disappeared in 2.12
+        # since some widgets get their own Scrollbar feature
+        scroll_win = gtk.ScrolledWindow()
+        scroll_win.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
+        scroll_win.add_events(gtk.gdk.SCROLL_MASK | gtk.gdk.BUTTON_PRESS_MASK)
+        scroll_win.show()
+        scroll_win.add(self.treeview)
+        # place scrolledwindow (containing treeview)
+        # and refresh button in a VBox
+        self.vbox = gtk.VBox(0, 1)
+        self.vbox.set_homogeneous(False)
+        self.vbox.set_spacing(2)
+        self.vbox.show()
+        self.vbox.pack_start(scroll_win, expand=True, fill=True)
+
+        # adding a popup menu such that one can use
+        # the mouse to add files in treeview and
+        # also delete or rename
+        self.dir_menu = gtk.Menu()
+        self.file_menu = gtk.Menu()
+        menu_item1 = gtk.MenuItem("add new file here..")
+        menu_item2 = gtk.MenuItem("delete file")
+        menu_item3 = gtk.MenuItem("rename file")
+        menu_item4 = gtk.MenuItem("open with")
+        self.dir_menu.append(menu_item1)
+        self.file_menu.append(menu_item2)
+        self.file_menu.append(menu_item3)
+        self.file_menu.append(menu_item4)
+        menu_item1.connect("activate", self.new_file)
+        menu_item2.connect("activate", self.delete_file)
+        menu_item3.connect("activate", self.rename_file)
+        menu_item4.connect("activate", self.open_with_alternative_exe)
+        menu_item1.show()
+        menu_item2.show()
+        menu_item3.show()
+        menu_item4.show()
+        self.dir_menu.show()
+        self.file_menu.show()
+        self.treeview.connect_object("button_press_event",
+                                     self.mouse_drop_down, self.dir_menu)
+        self.treeview.connect_object("button_press_event",
+                                     self.mouse_drop_down, self.file_menu)
+
+        # add refresh (F5 shortcut for same action)
+        button_refresh = gtk.Button("Refresh (F5)")
+        button_refresh.connect("clicked", self.refresh)
+        button_refresh.show()
+        ttip = "update directory tree from disk"
+##         button_refresh.set_tooltip_markup(mystyle%(ttip))
+        button_refresh.set_tooltip_markup(ttip)
+        self.vbox.pack_end(button_refresh, expand=False, fill=True)
+
+        self.add(self.vbox)
+
+        # do something for all children..
+        # self.foreach(self.recursive_cb)
+
+        # catch Ctrl+C
+        signal.signal(signal.SIGINT, self.quit_peacefully)
+
+    def grep_dialog(self):
+        """
+        grep in treestore, naturally this will be quite slow
+        compared to 'grep' but compensates somewhat by exiting
+        as soon as possible
+        """
+
+        grep_string = self.show_input_dialog("[ grep ]")
+
+        if(grep_string):
+
+            msg = "pattern found in <b> %s </b>"
+            msg += "\n<i> (matching file is selected) </i>"
+            msg += "\ncontinue searching for more matches?"
+
+            self.tree.foreach(self.tree_grep, (msg, grep_string))
+
+    def tree_grep(self, treemodel, path, iter, msg_pattern):
+        """ grep path if path == file, prompt user to proceed 4 every match """
+        msg, pattern = msg_pattern
+        abs_path = self.tree.get_value(iter, 1)
+        cpattern = re.compile(pattern)
+        if(os.path.isfile(abs_path) and self.grep(abs_path, cpattern)):
+            answer = self.yes_no_dialog(pango = msg % os.path.basename(abs_path),
+                                        title= 'grep results')
+            
+            self.treeview.expand_to_path(path)
+            self.treeview.set_cursor(path)
+
+            if(not answer):
+                return True
+
+
+    def grep(self, fname, c_pattern):
+        """ 
+        search for pattern in file, return True on first match
+        """
+
+        f = open(fname, 'r')
+        lines = f.readlines()
+
+        for line in lines:
+            match = c_pattern.search(line)
+            if(match): return True
+
+        return False
+
+
+
+    def recursive_cb(self, widget):
+        print "recursive: ", widget
+        if('foreach' in dir(widget)):
+            widget.foreach(self.recursive_cb)
+
+
+
+    def mouse_drop_down(self, widget, event):
+        """ 
+        show drop-down menu on right-click
+        if marked row is directory open 'add file menu',
+        if marked row is file open 'delete/rename menu' 
+        """
+
+        if event.button == 3:
+            
+            iter = self.get_current_selection()
+            if(not iter): return False
+
+            path = self.tree.get_value(iter, 1)
+
+            if(path and os.path.isdir(path) and (widget == self.dir_menu)):
+                widget.popup(None, None, None, event.button, event.time)
+                return True
+            elif(path and os.path.isfile(path) and (widget == self.file_menu)):
+                widget.popup(None, None, None, event.button, event.time)
+                return True
+
+        return False # pass event on
+
+
+    def get_current_selection(self):
+        """ return iter to current selection """
+        treeselection = self.treeview.get_selection()
+        (treestore, iter) = treeselection.get_selected()
+        return iter
+
+
+    def show_input_dialog(self, header):
+        """ generic input dialog used for:
+        delete - new file - grep - open - rename
+        """
+        
+        text = None
+
+        ndialog = gtk.Dialog(title=header,
+                             parent=self,
+                             flags=gtk.DIALOG_DESTROY_WITH_PARENT,
+                             buttons=(gtk.STOCK_OPEN
+                                      ,gtk.RESPONSE_OK
+                                      ,gtk.STOCK_CANCEL
+                                      ,gtk.RESPONSE_CANCEL))
+    
+        nentry = gtk.Entry()
+        nentry.show()
+        ndialog.vbox.add(nentry)
+        ndialog.get_response_for_widget(nentry)
+
+        if ndialog.run() == gtk.RESPONSE_OK:
+            text = nentry.get_text()
+
+        ndialog.destroy()
+        return text
+
+    
+    def get_marked_path_and_iter(self, widget, isOK, errormsg):
+        """ this function removes some duplicate code which
+        was common to the actions: delete - add - rename - open
+        and it naturally returns the iter and the path
+        that belongs to the current selected choice
+        isOK => os.path.isfile or os.path.isdir
+        """
+
+        iter = self.get_current_selection()
+
+        if(not iter): 
+            self.show_popup(message=errormsg); 
+            return None
+
+        path = self.tree.get_value(iter, 1)
+
+        if(widget == None): # have been called from KeyboardListener
+            if(iter and not isOK(path)):
+                self.show_popup(message=errormsg)
+                return None
+
+        return (iter, path)
+
+
+
+    def delete_file(self, widget):
+        """ delete file in treeview """
+
+        result =  self.get_marked_path_and_iter(widget,
+                                                isOK=os.path.isfile,
+                                                errormsg="delete: requires a selected file")
+        if(result):
+            (iter, path) = result
+
+            # are you sure dialog
+            msg=" are you sure you want to delete: %s"% os.path.basename(path)
+            
+            if self.yes_no_dialog(message=msg):
+                self.tree.remove(iter)
+                os.remove(path)
+
+
+
+
+    def open_with_alternative_exe(self, widget):
+        """ opens a file with a different executable if 
+        the executable given can be found in path"""
+        
+        result =  self.get_marked_path_and_iter(widget,
+                                                isOK=os.path.isfile,
+                                                errormsg="open: requires a selected file")
+        if(result):
+            (iter, path) = result
+
+            fname = self.show_input_dialog("[ new executable  ]")
+
+            if(fname):
+                if(TreeOptions.which(fname)):
+                    os.system(fname + ' "' + path + '" &')
+                else:
+                    self.show_popup("could not find executable: "+fname)
+
+
+
+    def rename_file(self, widget):
+        """ renames a file """
+        
+        result =  self.get_marked_path_and_iter(widget,
+                                                isOK=os.path.isfile,
+                                                errormsg="rename: requires a selected file")
+        if(result):
+            (iter, path) = result
+
+            fname = self.show_input_dialog("[ rename file ]")
+
+            if(fname):
+                new_path = os.path.dirname(path) + os.sep + fname
+                if(os.path.exists(new_path)):
+                    self.show_popup("already a file named: '"+fname+"' here")
+                    return
+                else:
+                    parent_iter = self.tree.iter_parent(iter)
+                    new_child = self.tree.append(parent_iter, (fname, new_path))
+                    self.tree.set(new_child)
+                    self.tree.remove(iter)
+                    os.rename(path, new_path)
+
+
+
+    def new_file(self, widget):
+        """ add file to a directory in treeview """
+        
+        result =  self.get_marked_path_and_iter(widget,
+                                                isOK=os.path.isdir,
+                                                errormsg="add file: requires a selected directory")
+        if(result):
+            (iter, path) = result
+
+            fname = self.show_input_dialog("[ new file name ]")
+
+            if(fname):
+                absolute_path = path + os.sep + fname
+                if(os.path.exists(absolute_path)):
+                    self.show_popup("already a file named: '"+fname+"' here")
+                    return
+                else:
+                    citer = self.tree.iter_children(iter)
+                    if citer != None and not self.is_dummy_node(self.tree, citer):
+                        child_iter = self.tree.append(iter, (fname, absolute_path))
+                        self.tree.set(child_iter)
+                    else:
+                        nyiter = self.tree.append(iter, (fname, absolute_path))
+                        self.tree.set(nyiter)
+
+                    global _config
+                    if(_config['executable'] != 'vim'):
+                        # do not touch Vim files this really
+                        # destroys the whole autocmd stuff
+                        open(absolute_path, 'w').close() 
+                    self.open_file(absolute_path)
+
+
+
+
+    def build_exe(self, executable, xterm, geo, exe_args, altterm, targs):
+        """ 
+        build the string that will be executed by a os.system call
+        when a filename is double-clicked or return is pressed
+        """
+        exe = []
+        if(altterm):
+            exe.append(altterm+' -e')
+        elif(xterm):
+            exe.append('xterm -geometry '+geo+' -bw 0 -e')
+
+        if(type(targs) in (str,)):
+            exe.append(targs)
+        elif(type(targs) in (list,)):
+            targs = [ str(a) for a in targs ]
+            exe.append( ' '.join(targs) )
+
+        exe.append(executable)
+
+        # add -geometry for emacs as well...
+        if((not xterm) and executable == 'emacs'):
+            exe.append('-geometry '+geo+' ')
+
+        if(type(exe_args) in (str,)):
+            exe.append(exe_args)
+        elif(type(exe_args) in (list,)):
+            exe_args = [ str(a) for a in exe_args ]
+            exe.append( ' '.join(exe_args) )
+
+        exe.append('"%s"') # filename will be inserted here..
+        exe.append("& ")   # background process
+
+        return " ".join(exe)
+        
+    def quit_peacefully(self, sig, frame):
+        """ quit without >> KeyboardInterrupt in gtk.main_loop...."""
+        self.rm_tmp_n_quit(None)
+
+    def rm_tmp_n_quit(self, widget):
+        """ 
+        if a tmpdir has been created to fake multiple
+        paths we must remove it before we exit the application
+        """
+        # remove tmp files if any
+        _unlink_tmp()
+        # destroy
+        gtk.main_quit()
+
+
+    def icmp(self, a, b):
+        """ ignore case during sort """
+        global _config
+        if( _config['numeric'] ):
+            pattern = "^(\d+)\.\w+$"
+            m1 = re.match(pattern, a)
+            m2 = re.match(pattern, b)
+            if( m1 and m2 ):
+                anum = int(m1.groups()[0])
+                bnum = int(m2.groups()[0])
+                return cmp(anum, bnum)
+        return cmp(a.lower(), b.lower())
+
+
+    def refresh(self, widget):
+        """ refresh file tree """
+        global _config
+        
+        self.tree = gtk.TreeStore(gobject.TYPE_STRING, gobject.TYPE_STRING)
+        self.gen_tree(_config['opendir'], self.tree, None)
+        self.treeview.set_model(self.tree)
+
+        return True
+
+
+    def split_file_dir_sort(self, pwd, sub):
+        """ make seperate lists for directories and files
+        such that the treeview looks a bit better"""
+
+        dirs=[]
+        files=[]
+
+        for elm in sub:
+            if(os.path.isdir(pwd + os.sep + elm)):
+                dirs.append(elm)
+            elif(os.path.isfile(pwd + os.sep + elm)):
+                files.append(elm)
+            else:
+                logging.error("'%s' not directory or file"%(elm))
+
+        dirs.sort(cmp=self.icmp)
+        files.sort(cmp=self.icmp)
+
+        return files + dirs
+
+
+    def gen_tree(self, pwd, treestore, parent):
+        """ fill directory tree (treestore) with content from path """
+
+        global _config
+
+        subdirs = os.listdir(pwd)
+        #  subdirs.sort(cmp=self.icmp)
+        subdirs = self.split_file_dir_sort(pwd, subdirs)
+
+        if(not parent and _config['topdir']):
+            parent = treestore.append(None, (os.path.basename(pwd), pwd)) 
+
+
+        for sub in subdirs: # do not include hidden or backup by default
+            if(not (sub.startswith('.') or sub.endswith('~')) or _config['hidden']):
+
+                # skip patterns which match filters
+                if(self.match_ignore_filter(sub)): continue
+                
+                iter = treestore.append(parent, (sub, pwd+os.sep+sub))
+                treestore.set(iter)
+
+                if(os.path.isdir(pwd+os.sep+sub)):
+                    if(_config['recursive']):
+                        self.gen_tree(pwd+os.sep+sub, treestore, iter)
+                    else: # only generate 1 level if recursive is turned off
+                        tmp_iter = treestore.append(iter ,("", "NULL"))
+                        treestore.set(tmp_iter)
+
+
+    def match_ignore_filter(self, element):
+        """ if our file/directory matches an ignore pattern
+        the file/directory should be ignored :-) """
+        global _config
+        for pattern in _config['filter']:
+            if(fnmatch.fnmatch(element, pattern)): return 1
+        return 0
+
+
+    def row_expanded(self, treeview, iter, path):
+        """ 
+        register that a row has been expanded, if we are in
+        non-recursive mode we have to fill in the directories
+        below our node if they have not been 'loaded' yet
+        """
+        if(not self.recursive):
+            if(not self.programmatic_expand):
+                path_to_dir = self.tree.get_value(iter, 1)
+                child_iter = self.tree.iter_children(iter)
+                if(child_iter != None):
+                    if(self.is_dummy_node(self.tree, child_iter)):
+                        self.tree.remove(child_iter)
+                        self.gen_tree(path_to_dir, self.tree, iter)
+                        # ensure that we dont end up in a loop that goes all the way down..
+                        self.expand_row(treeview, path, all=0)
+
+
+
+    def row_activated(self, treeview, coordinates, column):
+        """
+        double clicking a row in the treeview calls this function
+        depending on whether this is a file or a directory it will
+        be opened in VIM or its internal directory structure will
+        be presented    
+        """
+
+        treeselection = treeview.get_selection()
+        (treestore, iter) = treeselection.get_selected()
+
+        if iter is None:
+            return
+        else:
+            path_to_file_or_dir = treestore.get_value(iter, 1)
+
+        if(os.path.isfile(path_to_file_or_dir)):
+            self.open_file( path_to_file_or_dir )
+        elif(os.path.isdir(path_to_file_or_dir)):
+            if(treeview.row_expanded(coordinates)):
+                treeview.collapse_row(coordinates)
+            else:
+                if(not self.recursive):
+                    # remove child iter if value == NULL, and add actual files if any in subdir
+                    child_iter = treestore.iter_children(iter)
+                    if(child_iter != None):
+                        if(self.is_dummy_node(treestore, child_iter)):
+                            treestore.remove(child_iter)
+                            self.gen_tree(path_to_file_or_dir, treestore, iter)
+                            self.expand_row(treeview, coordinates, all=0)
+                        else:
+                            self.expand_already_opened(treeview, treestore, iter, coordinates)
+                    
+
+                else:    
+                    self.expand_row(treeview, coordinates, all=1)
+
+        else:
+            self.show_popup('not valid path (refresh file-tree)')
+
+
+
+    def expand_already_opened(self, treeview, treestore, iter, path):
+        """
+        rows are expanded recursively during non-recursive mode
+        if they have already been added to the treeview when
+        a double-click or space is pressed
+        """
+        cnt = treestore.iter_n_children(iter)
+        if(not cnt): return
+        for child in range(0, cnt):
+            child_iter = treestore.iter_nth_child(iter, child)
+            if(not self.is_dummy_node(treestore, child_iter)):
+                self.expand_row(treeview, path, all=0)
+                self.expand_already_opened(treeview, treestore, child_iter,
+                                     treestore.get_path(child_iter))
+
+
+    def is_dummy_node(self, treestore, iter):
+        """ 
+        this function will tell if a dummy node is in place,
+        this makes the treeview look like it has folders 
+        for directories even when they are just empty placeholders
+        for content not yet added to the treeview
+        """
+        dir = treestore.get_value(iter, 0)
+        abs_dir = treestore.get_value(iter, 1)
+        if(dir == "" and abs_dir == "NULL"):
+            return True
+        return False
+        
+    
+    def expand_row(self, treeview, path, all):
+        """ 
+        expand row and set self.programmatic_expand = True
+        to avoid handling an event
+        """
+        self.programmatic_expand = 1
+        treeview.expand_row(path, open_all=all)
+        self.programmatic_expand = 0
+
+
+    def open_file(self, input_file):
+        """ opens file in VIM (if already open just print a warning) """
+        filename = os.path.basename(input_file)
+        dirname = os.path.dirname(input_file)
+
+
+        if(os.path.isfile(dirname+os.sep+'.'+filename+'.swp')): #file already open
+            self.show_popup("file already open")
+        else:
+            os.system(self.exe %(input_file))
+
+
+    def show_popup(self, message='', title='Error', 
+                   pango_message='', dtype=gtk.MESSAGE_ERROR):
+        """ display pop-up with message and title """
+        dialog = gtk.MessageDialog(
+            parent=self,
+            flags=gtk.DIALOG_DESTROY_WITH_PARENT,
+            type=dtype,
+            buttons=gtk.BUTTONS_OK,
+            message_format=message)
+        dialog.set_title(title)
+        if(pango_message):
+            dialog.set_markup(pango_message)
+        dialog.connect('response', lambda dialog, response: dialog.destroy())
+        dialog.show()
+
+    
+    def yes_no_dialog(self, message='', title='', pango=''):
+        """ prompt user with a yes no dialog """
+        answer = False
+
+        dialog = gtk.MessageDialog(
+            type=gtk.MESSAGE_QUESTION,
+            parent=self,
+            flags=gtk.DIALOG_DESTROY_WITH_PARENT,
+            buttons=gtk.BUTTONS_YES_NO,
+            message_format=message)
+       
+        dialog.set_title(title)
+        if(pango):
+            dialog.set_markup(pango)
+
+        if dialog.run() == gtk.RESPONSE_YES:
+            answer = True
+        dialog.destroy()
+
+        return answer
+
+
+    def header_click(self, widget):
+        """ expand or collapse treeview (recursively) """
+        if(self.collapsed):
+            if(self.recursive):
+                self.treeview.expand_all()
+            else:
+                self.unrecursive_expand_all()
+            self.collapsed = 0
+        else:
+            self.treeview.collapse_all()
+            self.collapsed = 1
+        return True
+
+
+    def unrecursive_expand_all(self):
+        """ 
+        try to expand all directories that have been expanded before
+        this is only called when we are in unrecursive mode
+        """
+        self.tree.foreach(self.expand_if_expanded)
+
+
+    def expand_if_expanded(self, treestore, path, iter):
+        """
+        expand directory if already expanded
+        this is only relevant in non-recursive mode
+        """
+        child_iter = treestore.iter_children(iter)
+        if(child_iter != None):
+            if(not self.is_dummy_node(treestore, child_iter)):
+                  self.expand_row(self.treeview, path, all=0)
+
+            
+    def toggle_one_level(self):
+        """ toggle open/collapse one level in treeview """
+        treeselection = self.treeview.get_selection()
+        (treestore, iter) = treeselection.get_selected()
+        if(iter): # we have a selected path
+            path = treestore.get_path(iter)
+            if(self.treeview.row_expanded(path)):
+                self.treeview.collapse_row(path)
+            else:
+                self.treeview.expand_row(path, open_all=0)
+        return True
+
+
+
+#_____________________________________________________________________________#
+
+class KeyboardListener:
+    def __init__(self):
+        """
+        the KeyboardListener has a few local variables which
+        hold information about opacity and maximization and
+        generally things which are affected by the keyboard events
+        """
+        self.is_maximized = 0
+        self.scroll_x = 0
+        self.stuck = False
+        self.opac = 1.0
+        (self.cmd, self.explain) = self.format_keybindings()
+
+
+    def format_keybindings(self):
+        """ format the two columns for the shortcuts popup"""
+
+        cmds = []
+        explains = []
+        cmds.append("<b>Command:</b>\n")
+        explains.append("<b>Action:</b>\n")
+
+        for elm in TreeOptions.get_key_bindings():
+            if(re.match(r'^[^_]+ [_]+ [^_]+\s*$', elm)):
+                (first, last) = re.split(' [_]+ ', elm)
+                cmds.append(first)
+                explains.append(last)
+
+        cmds.append("\n")
+        explains.append("\n")
+
+        return ( "\n".join(cmds), "\n".join(explains))
+
+
+
+    def button_pressed(self, widget, event):
+        """ 
+        when keys are pressed this function is called 
+        see __doc__ or run 'btv -key-bindings'
+        to see all key-bindings supported
+        """
+
+        if( gtk.gdk.keyval_name(event.keyval) == "Right" ):
+            return self.scroll_right(widget)
+        elif( gtk.gdk.keyval_name(event.keyval) == "Left" ):
+            return self.scroll_left(widget)
+        elif( gtk.gdk.keyval_name(event.keyval) == "F5" ):
+            return widget.refresh(None) #fake refresh click
+        elif event.state & gtk.gdk.CONTROL_MASK:
+            if gtk.gdk.keyval_name(event.keyval) in  ["q", "w"]:
+                widget.rm_tmp_n_quit(None)
+            elif gtk.gdk.keyval_name(event.keyval) == "c":
+                r = widget.yes_no_dialog("quit?")
+                if(r):
+                    widget.rm_tmp_n_quit(None)
+            elif gtk.gdk.keyval_name(event.keyval) == "l":
+                return widget.header_click(None) #fake header click
+            elif gtk.gdk.keyval_name(event.keyval) == "m":
+                return self.maximize_unmaximize(widget)
+            elif gtk.gdk.keyval_name(event.keyval) == "s":
+                return self.stick_unstick(widget)
+            elif gtk.gdk.keyval_name(event.keyval) == "i":
+                widget.iconify()
+                return True
+            elif gtk.gdk.keyval_name(event.keyval) == "o":
+                widget.open_with_alternative_exe(None)
+                return True
+            elif gtk.gdk.keyval_name(event.keyval) == "plus":
+                return self.get_bigger(widget)
+            elif gtk.gdk.keyval_name(event.keyval) == "minus":
+                return self.get_smaller(widget)
+            elif gtk.gdk.keyval_name(event.keyval) == "0":
+                return self.init_position(widget)
+            elif gtk.gdk.keyval_name(event.keyval) in [ "Down", "Up" ]:
+                return widget.toggle_one_level()
+            elif gtk.gdk.keyval_name(event.keyval) == "d":
+                return widget.delete_file(None)
+            elif gtk.gdk.keyval_name(event.keyval) == "r":
+                return widget.rename_file(None)
+            elif gtk.gdk.keyval_name(event.keyval) == "a":
+                return widget.new_file(None)
+            elif gtk.gdk.keyval_name(event.keyval) == "h":
+                ShortCutWindow(widget, self.cmd, self.explain)
+                return True
+            elif gtk.gdk.keyval_name(event.keyval) == "x":
+                os.system("xterm &")
+                return True
+            elif gtk.gdk.keyval_name(event.keyval) == "g":
+                widget.grep_dialog()
+                return True
+        elif event.state & gtk.gdk.MOD1_MASK:
+            if gtk.gdk.keyval_name(event.keyval) == "plus":
+                vb = widget.get_child() # vb = VBox
+                tview = vb.get_children()[0].get_child() # treeview
+                cellrendr = tview.get_column(0).get_cell_renderers()[0]
+                font_scale = cellrendr.get_property("scale")
+                if font_scale == 0:
+                    font_scale = 1.0
+                if font_scale < 1.5 :
+                    font_scale += .1
+                    cellrendr.set_property("scale", font_scale)
+                widget.queue_draw()
+                return True
+            if gtk.gdk.keyval_name(event.keyval) == "minus":
+                vb = widget.get_child() # vb = VBox
+                tview = vb.get_children()[0].get_child() # treeview
+                cellrendr = tview.get_column(0).get_cell_renderers()[0]
+                font_scale = cellrendr.get_property("scale")
+                if font_scale == 0:
+                    font_scale = 1.0
+                if font_scale > .1 :
+                    font_scale -= .1
+                    cellrendr.set_property("scale", font_scale)
+                widget.queue_draw()
+                return True
+
+
+
+
+    def get_bigger(self, widget):
+        """ make application window 7 pst bigger"""
+        (w, h) = widget.get_size()
+        widget.resize(int(w*1.07), int(h*1.07))
+
+    def get_smaller(self, widget):
+        """ make application window 7 pst smaller"""
+        (w, h) = widget.get_size()
+        widget.resize(int(w*.93), int(h*.93))
+
+    def init_position(self, widget):
+        """ move window to (0,0) """
+        widget.move(0, 0)
+
+    def scroll_right(self, widget):
+        """ scrolls treeview to the right if content is larger than widget """
+        self.scroll_x +=70
+        widget.treeview.scroll_to_point(tree_x=self.scroll_x,tree_y=-1)
+        return True
+
+    def scroll_left(self, widget):
+        """ scrolls treeview to the left if content is larger than widget """
+        if(self.scroll_x < 20):
+            self.scroll_x = 0
+        else:
+            self.scroll_x = int(self.scroll_x/2)
+        widget.treeview.scroll_to_point(tree_x=self.scroll_x,tree_y=-1)
+        return True
+
+    def maximize_unmaximize(self, widget):
+        """ (un)maximize application window """
+        if(self.is_maximized):
+            widget.unmaximize()
+            self.is_maximized = 0
+        else:
+            widget.maximize()
+            self.is_maximized = 1
+        return True
+
+    def less_opacity(self, widget):
+        """ give application lower opacity """
+        if(self.opac > 0.2):
+            self.opac -= .1
+            widget.set_opacity(self.opac)
+        return True
+
+    def more_opacity(self, widget):
+        """ give application higher opacity """
+        if(self.opac < 1.0):
+            self.opac += .1
+            widget.set_opacity(self.opac)
+        return True
+
+    def stick_unstick(self, widget):
+        """ toggle visibility on all desktops """
+        if(self.stuck):
+            widget.unstick()
+            self.stuck = 0
+        else:
+            widget.stick()
+            self.stuck = 1
+        return True
+
+
+
+#_____________________________________________________________________________#
+
+
+
+class ShortCutWindow(gtk.Window):
+    def __init__(self, parent, markupL, markupR):
+        gtk.Window.__init__(self)
+
+        # make sure this is child window of our main
+        # window, this changes placing and so on..
+        self.set_transient_for(parent)
+
+        hbox = gtk.HBox(homogeneous=True, spacing=5)
+
+        self.set_title("ShortCuts")
+        # the commands
+        labelL = gtk.Label()
+        labelL.set_markup(markupL)
+        labelL.set_justify(gtk.JUSTIFY_LEFT)
+        labelL.set_padding(10, 10)
+        labelL.show()
+
+        # explanations
+        labelR = gtk.Label()
+        labelR.set_markup(markupR)
+        labelR.set_justify(gtk.JUSTIFY_LEFT)
+        labelR.set_padding(10, 10)
+        labelR.show()
+       
+        # these hold the two pango markups
+        hbox.add(labelL)
+        hbox.add(labelR)
+        hbox.show()
+
+        separator = gtk.HSeparator()
+
+        topbox = gtk.VBox()
+        topbox.add(hbox)
+        topbox.add(separator)
+        separator.show()
+        topbox.show()
+
+
+        # the the OK button
+        quitbox = gtk.HBox(False, 0)
+        button = gtk.Button(stock=gtk.STOCK_OK)
+        button.connect('clicked', self.kill_window)
+        quitbox.pack_start(button, True, False, 0)
+
+        button.show()
+        quitbox.show()
+
+        # holds the two Labels and the quitbox
+        vbox = gtk.VBox(False, 4)
+
+        vbox.add(topbox)
+        vbox.add(quitbox)
+
+        vbox.show()
+
+
+        self.add(vbox)
+        self.show()
+
+    def kill_window(self, wid):
+        self.destroy()
+        
+
+
+#______________________________________________________________________________#
+
+
+class TreeGFX:
+    """
+    this class really just holds a couple of pictures
+    just wanted it all to fit into one script so
+    xpm is used
+    """
+    def __init__(self):
+
+        self.bruce_logo = None
+        self.cheese_logo = None
+        self.ninja_logo = None
+
+        # very little modification is needed in order
+        # to turn the btv into a cheesebar :-)
+
+        self.ost_xpm  = [
+            "38 38 31 1",
+            " 	c None",
+            ".	c #00EC00",
+            "+	c #00DA00",
+            "@	c #00D800",
+            "#	c #00C400",
+            "$	c #00B300",
+            "%	c #00AF00",
+            "&	c #00A200",
+            "*	c #008300",
+            "=	c #007400",
+            "-	c #006C00",
+            ";	c #005B00",
+            ">	c #005600",
+            ",	c #004000",
+            "'	c #003C00",
+            ")	c #08F808",
+            "!	c #28FF28",
+            "~	c #2AFF2A",
+            "{	c #40FF40",
+            "]	c #5BFF5B",
+            "^	c #60FF60",
+            "/	c #65FF65",
+            "(	c #6DFF6D",
+            "_	c #7EFF7E",
+            ":	c #8FFF8F",
+            "<	c #9EFF9E",
+            "[	c #A2FFA2",
+            "}	c #AFFFAF",
+            "|	c #BDFFBD",
+            "1	c #D1FFD1",
+            "2	c #F1FFF1",
+            "                12                    ",
+            "               1|(<                   ",
+            "              1|(:{(                  ",
+            "             1|}::/{!(                ",
+            "             |:_/^//{{{1              ",
+            "            |:/^^/____{{(             ",
+            "           |::^!!!!^_[:_{{<           ",
+            "          1|:!.++++!^_}}:/{(          ",
+            "         2|}^+%%%++!^^[}[_/{{<        ",
+            "        21|:+%%%%++!^_[[[_//{{(1      ",
+            "       1||:_+%%%%+!^_[[[_^^^/{{{<     ",
+            "     1||::/_{+%%%+.^[[[_^^^^^//{{{    ",
+            "    1|}:_^^^^^!.+.!_____^^^^^^///{!   ",
+            "   2||:_^^^//^___^^^^/_____//////{!.  ",
+            "   1}}}:[[___^^^^^^^^!!!^_:^!!....$&  ",
+            "   </!^}|}_^^^^////^.++!!^!++###$$&*  ",
+            "   </!!_|}___///^!!.++.!^..###$%&%*-  ",
+            "   1/!!^}}^!!!..#####+...#$&&$$&&*-;  ",
+            "   </^^^_^..####%$%$%$$#$----&$&&*>;  ",
+            "   |::/__!+##%$&%&%&&$%&->>>-*%&*>=   ",
+            "   |||_:_.#%&%&%&&&%&&$*->>>-&$&-=    ",
+            "   |1|[}/+#$######&&&&$*->--*&$*-]    ",
+            "  1|1|}}.###&-->*$#&&&$&---*$#&*%     ",
+            " 2|}}}}{++$>,,,,,>$$&&&$&&&$#$&&@     ",
+            " 1}}[}^.#$>,,,,>>>*#$&&&$$#$$$$$%     ",
+            " |}::!+##*,,,>>>>>*#$$&&&$&&$$$#$)    ",
+            " :/!.####-,>>>;>>-&.$&&$$***&$$##$~   ",
+            " !.+##$##->>>>---*##$$&$&****#$$$#$   ",
+            " !.####$#->>>>---&.#&&$&&&*&$$$$&**   ",
+            " !.+#%$$#&->>---$.#$&$&&&&$&&&&**;;   ",
+            " !.###%$$#&*--*$.#$$&&&*&*****-;''=   ",
+            " !.+##$$$$$$$$#.$&&***;*;;;'''''''    ",
+            " {.+###$$$$&$$&**;;;;;'''''=          ",
+            " ^..##$$&&**-;;;''''===               ",
+            " /.#$&****=%%%%%@                     ",
+            " (.&*--;%~                            ",
+            " (&;;;=                               ",
+            "                                      "
+            ]
+
+        self.bruce_lee_xpm = [
+            "32 42 5 1",
+            " 	c None",
+            ".	c #FFFFFF",
+            "+	c #000000",
+            "@	c #00CC00",
+            "#	c #FFFF00",
+            "        ++++++++                ",
+            "        ++++++++                ",
+            "    ++++++++####                ",
+            "    ++++++++####                ",
+            "    ++++########++++            ",
+            "    ++++########++++            ",
+            "    ++++####++++####            ",
+            "    ++++####++++####            ",
+            "    ++++############            ",
+            "    ++++############            ",
+            "        ############            ",
+            "        ############            ",
+            "        ########                ",
+            "        ########                ",
+            "    ############                ",
+            "    ############                ",
+            "    ################            ",
+            "    ################            ",
+            "    ########++++########    ++++",
+            "    ########++++########    ++++",
+            "    ####++++++++############++++",
+            "    ####++++++++############++++",
+            "        ############            ",
+            "        ############            ",
+            "        ++++++++++++            ",
+            "        ++++++++++++            ",
+            "        ++++++++++++            ",
+            "        ++++++++++++            ",
+            "        ++++    ++++++++        ",
+            "        ++++    ++++++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "        ++++        ++++        ",
+            "    ++++++++        ++++++++    ",
+            "    ++++++++        ++++++++    ",
+            "++++++++++++        ++++++++++++",
+            "++++++++++++        ++++++++++++"
+            ]
+
+
+        self.ninja_xpm = [
+            "35 41 2 1",
+            " 	c None",
+            ".	c #000000",
+            "                               ....",
+            "                               ....",
+            "        .........              ....",
+            "        ..........             ....",
+            "        ..............         ....",
+            "        ..............         ....",
+            "                 .....         ....",
+            "                  ....         ....",
+            "         .............         ....",
+            "        ..............         ....",
+            "        ..............         ....",
+            "        ..............         ....",
+            "        ..............         ....",
+            "             .........         ....",
+            "             .........         ....",
+            "         .................     ....",
+            "        ..................     ....",
+            "     .....................     ....",
+            "    ......................     ....",
+            "    ...............................",
+            "    ...............................",
+            "    ...............................",
+            "    ...............................",
+            "    ...............................",
+            "....    ..................     ....",
+            "....     .................     ....",
+            "....         .........         ....",
+            "....         .........         ....",
+            "        ..................     ....",
+            "        ..................     ....",
+            "        ..................         ",
+            "        ..................         ",
+            "        ..................         ",
+            "    .........         ....         ",
+            "    .........         ....         ",
+            "    ....              .........    ",
+            "    ....              .........    ",
+            "    ....                  .....    ",
+            "    ....                  .....    ",
+            "........                  .........",
+            "........                  ........."
+            ]
+
+
+
+
+    def get_logo(self, s):
+        if(s == 'bruce'): 
+            return self.get_bruce_logo()
+        elif(s == 'cheese'):  
+            return self.get_cheese_logo()
+        elif(s == 'ninja'):
+            return self.get_ninja_logo()
+        else: # default to bruce
+            return self.get_bruce_logo()
+
+    def get_cheese_logo(self):
+        if(not self.cheese_logo):
+            self.cheese_logo = gtk.gdk.pixbuf_new_from_xpm_data(self.ost_xpm)
+        return self.cheese_logo
+
+
+    def get_bruce_logo(self):
+        if(not self.bruce_logo):
+            self.bruce_logo =  gtk.gdk.pixbuf_new_from_xpm_data(self.bruce_lee_xpm)
+        return self.bruce_logo
+
+
+    def get_ninja_logo(self):
+        if(not self.ninja_logo):
+            self.ninja_logo =  gtk.gdk.pixbuf_new_from_xpm_data(self.ninja_xpm)
+        return self.ninja_logo
+
+
+    def get_all(self):
+        logos = []
+        logos.append(self.get_cheese_logo())
+        logos.append(self.get_bruce_logo())
+        logos.append(self.get_ninja_logo())
+        return logos
+
+
+
+#______________________________________________________________________________#
+
+
+
+# included my own getopt version since i don't like
+# the getopt of Python and optparse never made that
+# much sense to me...havent included all the
+# documentation but use is similar to getopt
+# but long options starting with a single '-' are
+# allowed, options can also be tested with a
+# boolean function and one can specify the number of
+# trailing arguments
+
+
+class Option:
+    """
+    Option
+
+    super class for the StringOption and BoolOption
+    the functions and elements they have in common are placed
+    in this class. this way we can avoid some of the
+    isinstance - checking later on..
+    """
+    def __init__(self, opts):
+
+        if(type(opts) in (str,)):
+            self.opts = [opts]
+        elif(type(opts) in (list,)):
+            self.opts = [ str(o) for o in opts ]
+
+    def contains(self, opt):
+        """ tells wheter an option can be found in this Option object """
+        if(opt in self.opts):
+            return 1
+        else:
+            return 0
+     
+
+#______________________________________________________________________________#
+
+
+class StringOption(Option):
+    """
+    StringOption
+
+    this class holds options which are not only switches (on/off)
+    but require trailing arguments. an exception is raised if the
+    number of trailing arguments differ from what it should be.
+    there is also the possibility to test each trailing argument 
+    by providing a  function which returns a boolean result pending
+    on the whether the argument fulfilled the requirements.
+
+    example:
+
+    test_func = lambda x : re.match(r'^[0-9]+$', x)
+
+    sending this as the test func will make sure that all options
+    are actually natural numbers (or else an exception is raised).
+    """
+
+    def __init__(self, opts, trailing=1, default=[], test=None, errormsg=None):
+        Option.__init__(self, opts)
+    
+        self.trailing = trailing
+        self.default = default
+        self.test = test
+        self.values = []
+        self.errormsg = errormsg
+
+    def test_arg(self, arg):
+        """ 
+        if there is given a test function trailing arguments will
+        be tested against it, should any of them fail an exception is
+        raised
+        return -> Boolean
+        """
+        return ((not self.test) or self.test(arg))
+
+    def add_value(self, v):
+        """ add a trailing argument to this option"""
+        self.values.append(v)
+    
+    def get_value(self):
+        """ return trailing arguments"""
+        return self.values
+
+    def is_set(self):
+        """ tell's whether or not an option was given as an input argument """
+        return (self.values != self.default)
+
+        
+#______________________________________________________________________________#
+
+
+class BoolOption(Option):
+    """
+    BoolOption
+
+    this class represents the options that do not
+    take any trailing arguments, but are only switches
+    that can be turned on
+    """
+    def __init__(self, opts):
+        Option.__init__(self, opts)
+        self.set = 0
+    
+    def set_it(self):
+        """ sets boolean argument, which means  """
+        self.set = 1
+
+    def get_value(self):
+        """ returns value for BoolOption (True/False) """
+        return self.set
+
+    def is_set(self):
+        """ tells whether or not this option was set """
+        return self.set
+
+
+#______________________________________________________________________________#
+
+
+
+class GetOpt:
+    """
+    GetOpt
+
+    this class parses the input arguments and inserts the
+    arguments into the option classes where they belong.
+    """
+
+    def __init__(self,opts=None):
+        
+        self.remain = []
+        self.opts = []
+
+        if(opts):
+            self.add(opts)
+
+
+    def add(self, opts):
+        """ add option or list of options to GetOpt """
+        if(type(opts) in (list,)):
+            for elm in opts:
+                if(not isinstance(elm, (StringOption, BoolOption))):
+                    raise Exception("StringOption or BoolOption required")
+            self.opts += opts
+        else:
+            if(not isinstance(opts, (StringOption, BoolOption))):
+                raise Exception("StringOption or BoolOption required")
+            self.opts.append(opts)
+
+
+    def add_bool_option(self, opts):
+        """ initialize and add a BoolOption to GetOpt """
+        b_opt = BoolOption(opts)
+        self.add(b_opt)       
+
+
+    def add_str_option(self, opts, trailing=1, default=[], test=None, errormsg=None):
+        """ initializa and add a StringOption to GetOpt """ 
+        # if "--spam" is an option, add "-spam", "--spam=" and "-spam=" as options
+        new_opts = []
+        for o in opts:
+            if o[:2] == "--":
+                new_opts.append("-"  + o[2:])
+                new_opts.append("-"  + o[2:] + "=")
+                new_opts.append("--" + o[2:] + "=")
+
+        opts = opts + new_opts
+        
+        s_opt = StringOption(opts, trailing=trailing, default=default, test=test, errormsg=errormsg)
+        self.add(s_opt)
+
+
+    def preprocess(self, args):
+        """
+        this function seperates options from arguments
+        if they are written as one word (--file=somefile)
+        given that the '--file=' option requires an argument
+        if not they are left as is.
+        return -> list of arguments where some may have been split up
+        
+        preprocess(['-o', 'something', '-I/usr/lib']) -> ['-o', 'something', '-I', '/usr/lib']
+        
+        if '-I' is an option which takes an argument 
+        """
+
+        real_args = []
+        s_opts = []
+        cmp_func = lambda x, y : len(x) < len(y) or -1
+        
+
+        for i in self.opts:
+            if(isinstance(i, StringOption)):
+                s_opts += i.opts
+
+    
+        for arg in args:
+            
+            possible_opts = []
+
+            for so in s_opts:
+                if(arg.startswith(so)):
+                    if not self.is_option(arg):
+                        possible_opts.append(so)
+            
+            if(possible_opts):
+                if(len(possible_opts) > 1):
+                    possible_opts.sort(cmp_func)
+
+                option = possible_opts[0]
+                real_args.append(arg[0:len(option)])
+                real_args.append(arg[len(option):])
+
+            else:
+                real_args.append(arg)
+
+        return [ o.strip() for o in real_args if o.strip() != ""]
+
+
+
+    def parse(self, args):
+        real_args = self.preprocess(args)
+
+        while(real_args):
+            arg = real_args.pop(0)
+            possible_opt = self.is_option(arg)
+            if(possible_opt and isinstance(possible_opt, BoolOption)):
+                # if boolean just pop and set
+                possible_opt.set_it()
+            elif(possible_opt and isinstance(possible_opt, StringOption)):
+                # strip and check
+                if(possible_opt.trailing > 0):
+                    for elm in range(0, possible_opt.trailing):
+                        if(real_args):
+                            possible_arg = real_args[0]
+                            if(self.is_option(possible_arg)):
+                                raise Exception("got option '"+str(possible_arg)+"' expected argument")
+                            elif(possible_opt.test_arg(possible_arg)):
+                                real_args.pop(0) # pop argument of arg-list
+                                possible_opt.add_value(possible_arg)
+                            else:
+                                if(possible_opt.errormsg):
+                                    msg = possible_opt.errormsg
+                                else:
+                                    msg = "argument '"+str(possible_arg)+"' failed argument test for option '"+str(arg)+"'"
+                                raise Exception(msg)
+                        else:
+                            raise Exception("option: "+str(arg)+
+                                            " (requires "+str(possible_opt.trailing)+" arguments)")
+                
+                else:
+                    while(real_args):
+                        possible_arg = real_args[0]
+                        # horrible test, but needed to ensure traling
+                        # arguments which are also actual options
+                        if( not  (self.is_option(possible_arg) and
+                                  possible_opt.get_value() ) and
+                           possible_opt.test_arg(possible_arg) ):
+                            possible_opt.add_value(possible_arg)
+                            real_args.pop(0)
+                        else:
+                            break
+
+
+            else:
+                self.remain.append(arg)
+
+        return (self.gen_xdict(), self.remain)
+
+
+    def gen_xdict(self):
+        """ 
+        this function generates an 'extended' dictionary from
+        the options, the xdict class has some overloaded functions to
+        ease the fetching, and locating of elements.
+        """
+        h = xdict()
+        for o in self.opts:
+            if(o.is_set()):
+                h[tuple(o.opts)] = o.get_value()
+        return h
+
+
+    def is_option(self, arg):
+        """ tells whether some argument is an option """
+        for opt in self.opts:
+            if(opt.contains(arg)):
+                return opt
+        return None
+
+
+    def __str__(self):
+        """ formats the options for pretty printing of all options """
+        r_str = "\n\noptions:\n\n"
+        
+        if(not self.opts): return ""
+        for op in self.opts:
+            r_str += "+  [ "+"   ".join(op.opts) +" ]\n"
+        return r_str
+
+
+#______________________________________________________________________________#
+
+class xdict(dict):
+    """
+
+    this class extends the regular dictionary with a few
+    facilities, which makes it easy to fetch an item even though
+    its keys are tuples.
+    example:
+
+    h[('-v', '--version')] = 1
+
+    can be a typical entry, but since __getitem__ is overloaded
+    these can be fetched using:
+
+    h['-v']
+
+    or
+
+    h['--version']
+
+    also the dict.keys() function has been overloaded
+    """
+    def __init__(self):
+        dict.__init__(self)
+    
+    def keys(self):
+        """ 
+        return list of 'all' keys, since keys can be tuples 
+        something has to be done in order to get all of them
+        returned as one list.
+        """
+        super_keys = dict.keys(self)
+        my_keys = []
+        for keys in super_keys:
+            my_keys += list(keys)
+
+        return my_keys
+
+    def __getitem__(self, k):
+        """ return an element if it is part of a tuple-key """
+        if(k in self.keys()):
+            for keys in dict.keys(self):
+                if(k in keys):
+                    return dict.__getitem__(self,keys)
+        else:
+            raise KeyError(str(k))
+
+
+#______________________________________________________________________________#
+
+class TreeOptions:
+
+    """
+    
+    btv gives you a treeview or directory listing 
+    which opens files in Xterm+Vim by default
+    but can easily be configured to open files in 
+    any editor/program.
+
+    usage: btv [OPTIONS] [DIR_1] [DIR_2] ...
+
+    options:
+
+    -h  --help              print this menu and exit
+    -v  --version           print version and exit
+    -k  --key-bindings      print key-bindings and exit
+    -n  --non-recursive     do not add files recursively
+    -y  --min-height        minimum heigth (default: %s)
+    -x  --min-width         minimum width  (default: %s)
+    -g  --geometry          xterm geometry (default: %s)
+    -f  --filter            ignore files/directories matching filter (wildcard)
+    -e  --editor --exe      editor/executable to open files with (default:vim)
+    -s  --stand-alone       editor/executable runs on it's own not in xterm
+    -a  --args              editor args (emacs -nw == -e emacs --args -nw)
+    -t  --top-dir           include parent (if only one) in treeview
+    -c  --alt-term          use different console / terminal emulator
+    -numeric                sort files/directories numerically
+    --termargs              pass arguments to terminal emulator
+    --hidden                show backup (*~) and hidden (.*) files
+    --no-xterm              alias for --stand-alone
+    --logo                  legal values: bruce | ninja | cheese
+    --no-splash             do not show splash sceen at startup
+    --title                 set alternative title (default: %s)
+    --howto                 show examples of how to open your files 
+                            in a running instance of: VIM/GVIM/EMACS/GEDIT
+    """
+
+    def __init__(self):
+        self.opts = {}
+        self.args = {}
+        self.tmpdir = None
+
+
+    def new_getopt(self):
+        getopt = GetOpt()
+        getopt.add_bool_option(['-h', '-help', '--help'])
+        getopt.add_bool_option(['-v', '-version', '--version'])
+        getopt.add_bool_option(['-hidden', '--hidden'])
+        getopt.add_bool_option(['-howto', '--howto'])
+        getopt.add_bool_option(['-s', '-stand-alone', '--stand-alone', 
+                                '-no-xterm', '--no-xterm'])
+        getopt.add_bool_option(['-t', '-top-dir', '--top-dir']) 
+        getopt.add_bool_option(['-k', 
+                                '-key-binding', 
+                                '--key-bindings', 
+                                '-key-bindings',
+                                '--key-binding'])
+        getopt.add_bool_option(['-n', '-non-recursive', '--non-recursive'])
+        getopt.add_bool_option(['-numeric', '--numeric'])
+        getopt.add_bool_option(['-no-splash', '--no-splash', '-nosplash',
+                               '--nosplash'])
+        getopt.add_str_option(['-x', '-x=', '--min-width'], 
+                              test = lambda x : re.match(r'^\d+$', x), 
+                              errormsg="'-x|--min-width' argument must be integer")
+        getopt.add_str_option(['-y', '-y=', '--min-height'], 
+                              test = lambda x : re.match(r'^\d+$', x), 
+                              errormsg="'-y|--min-height' argument must be integer")
+        getopt.add_str_option(['-g', '--geometry', '-g='],
+                              test = lambda x : re.match(r'^\d+x\d+$', x),
+                              errormsg="-geometry format: 100x20 (columns x lines)")
+        getopt.add_str_option(['-e', '--editor', '--exe'],
+                              test = TreeOptions.which,
+                              errormsg="bad '--editor/--exe' argument, not found in path")
+        getopt.add_str_option(['--title'])
+        getopt.add_str_option(['--termargs'], 
+                              trailing=-1)
+        getopt.add_str_option(['-f', '--filter'],
+                             trailing=-1);
+        getopt.add_str_option(['-c', '--console', '--alt-term'],
+                              test = TreeOptions.which,
+                              errormsg="could not find 'alternative console' in path")
+        getopt.add_str_option(['-a', '--args'], trailing=-1)
+        getopt.add_str_option(['--logo'], test = lambda a: a in
+                             ['bruce', 'cheese', 'ninja'],
+                              errormsg="'-logo' must bin in: ninja|bruce|cheese")
+        getopt.add_str_option(['-l', '--log-level'],
+                              test= self.log_level,
+                              errormsg="'-log-level' must be in: debug|error|warning|critical")
+
+        return getopt
+
+
+    def log_level(self, s):
+        return s.lower() in ['debug', 'error', 'warning', 'critical', 'info']
+    
+    def parse_argv(self, argv):
+        """ 
+        parse input options and arguments
+        these can also be given in file ~/.btvrc
+        """
+        getopt = self.new_getopt()
+        try:
+            (self.opts, self.args) = getopt.parse(argv)
+        except Exception, inst:
+            print inst
+            sys.exit(1)
+
+
+    def parse_rc(self):
+        """ 
+        if .btvrc is found in HOME directory parse content from
+        this file as they where command line arguments.
+        note that comments are ignored (# <---> EOL  comment)
+        """
+        rc_file = os.path.join(os.environ['HOME'], ".btvrc")
+        if os.path.isfile(rc_file) and os.access(rc_file, os.R_OK):
+            f = open(rc_file, 'r')
+            lines = f.readlines()
+            lines_no_comments = [ re.sub('\#.*$', '', line).strip() for line in lines if line != '\n' ]
+            rc_args = ' '.join(lines_no_comments)
+            fake_argv = re.split('\s+', rc_args.strip())
+            self.parse_argv(fake_argv)
+        
+
+
+    def refill_defaults(self, defaults):
+        """
+        fills up defaults with content from command line or from
+        config-file, command line overrides config-file options
+        """
+        
+        # handle help, key-bindings and version and exit
+        if(self.is_set('-help')):         self.help(); sys.exit(1)
+        if(self.is_set('-version')):      self.version(); sys.exit(1)
+        if(self.is_set('-key-bindings')): self.key_bindings(); sys.exit(1)
+        if(self.is_set('-howto')):        self.howto(); sys.exit(1)
+        
+
+        # refill defaults pending on given options
+        if(self.is_set('-non-recursive')): defaults['recursive'] = False
+        if(self.is_set('-numeric')):       defaults['numeric'] = True
+        if(self.is_set('--min-width')):    defaults['min_w'] = int( self.get_value('--min-width') )
+        if(self.is_set('--min-height')):   defaults['min_h'] = int( self.get_value('--min-height') )
+        if(self.is_set('-geometry')):      defaults['geometry'] =  self.get_value('-geometry')
+        if(self.is_set('--exe')):          defaults['executable'] = self.get_value('-exe')
+        if(self.is_set('--no-xterm')):     defaults['xterm'] = False
+        if(self.is_set('-args')):          defaults['exe_args'] = self.get_value('-args')
+        if(self.is_set('-top-dir')):       defaults['topdir'] = True 
+        if(self.is_set('-ninja')):         defaults['ninja'] = True
+        if(self.is_set('-logo')):          defaults['logo'] = self.get_value('-logo')
+        if(self.is_set('-hidden')):        defaults['hidden'] = True
+        if(self.is_set('-nosplash')):      defaults['splash'] = False
+        if(self.is_set('-title')):         defaults['title'] = self.get_value('-title')
+        if(self.is_set('-termargs')):      defaults['termargs'] = self.get_value('-termargs')
+        if(self.is_set('-alt-term')):      defaults['altterm'] = self.get_value('-alt-term')
+        if(self.is_set('-filter')):        defaults['filter'] += self.opts['-f'] # list
+
+        # create a new directory in /tmp with a symlink
+        # to all directories if more than one is given
+        global _tmpdir_
+        if(len(self.args) > 0 and _tmpdir_):
+            _unlink_tmp()
+        if(len(self.args) == 1):
+            self.dir_check(self.args[0])
+            defaults['opendir'] = re.sub('\/$', '', self.args[0])
+        elif(len(self.args) > 1):
+            strip_dir_end_args = [ re.sub('\/$', '', elm) for elm in self.args ]
+            defaults['opendir'] = self.create_tmp_topdir(strip_dir_end_args)
+
+
+
+    def dir_check(self, dir):
+        if(not os.path.isdir(dir)):
+            print "not a valid path to a directory: ",dir
+            sys.exit(1)
+        
+
+    def create_tmp_topdir(self, dirs):
+        """ 
+        create a new directory in /tmp with 
+        symlink to top-level directories 
+        """
+        
+        # must be directory  
+        for d in dirs: self.dir_check(d)
+
+        global _tmpdir_
+        _tmpdir_ = tempfile.mkdtemp()
+        for dir in map(os.path.abspath, dirs):
+            symname = _tmpdir_ + os.sep + os.path.basename(dir)
+            os.symlink(dir, symname)
+        return _tmpdir_
+
+
+    @staticmethod
+    def which (filename):
+        """ 
+        checks whether the program given to open files 
+        can be found in path (modified from pexpect) 
+        static since needed elsewhere also perhaps
+        """
+    
+        # filename already contains a path.
+        if os.path.dirname(filename) != '':
+            if os.access (filename, os.X_OK):
+                return True
+    
+        if not 'PATH' in os.environ.keys() or os.environ['PATH'] == '':
+            p = os.defpath
+        else:
+            p = os.environ['PATH']
+    
+        pathlist = p.split(os.pathsep)
+    
+        for path in pathlist:
+            f = os.path.join(path, filename)
+            if os.access(f, os.X_OK):
+                return True
+        return False
+
+
+    def is_set(self, option):
+        """ report whether or not option was set """
+        return option in self.opts.keys()
+
+
+    def get_value(self, option):
+        """ get the value for a string-option """
+        if(len(self.opts[option]) > 1):
+            return self.opts[option]
+        else: 
+            return self.opts[option][0]
+
+
+    @staticmethod
+    def get_key_bindings():
+        """ generate key binding string from __doc__ """
+        kb = []
+        go_on = 0
+        for line in __doc__.split("\n"):
+            
+            if(re.match(r'^end keybinding\s*', line)):
+                go_on = 0
+
+            if(re.match(r'\s*Key-bindings:\s*', line)):
+                go_on = 1
+
+            if(go_on):
+                kb.append( line )
+        return kb
+ 
+    def key_bindings(self):
+        """ print key-bindings to stdout """
+        kb = TreeOptions.get_key_bindings()
+        for k in kb:
+            print k
+
+    def get_args(self):
+        """ return remaining arguments """
+        return self.args
+
+    def help(self):
+        """ print help message (help is self.__doc__) """
+
+        global _config
+        
+        help_string = self.__doc__ %(_config['min_h'], 
+                                     _config['min_w'], 
+                                     _config['geometry'],
+                                     _config['title'])
+
+        for line in help_string.split("\n"):
+            print line[3:]
+
+    def version(self):
+        """ print version and exit """
+        print "btv ", __version__
+
+    def howto(self):
+        """
+        howto
+
+        open your files in a running instance
+
+        VIM:
+            
+            start a vim instance as a server like this:
+            
+            > vim --servername VIM
+
+            > btv --no-xterm --exe vim --args --remote-tab
+
+            will open all files in the running VIM instance
+
+
+        GVIM:
+
+            start a gvim instance as a server like this:
+
+            > gvim --servername GVIM
+
+            > btv --no-xterm --exe gvim --args --remote-tab
+
+            will open all files in the running GVIM instance
+
+
+        EMACS:
+
+            start an emacs server like this:
+
+            > emacs 
+
+            M-x server-start
+
+            or you could add a server-start option
+            to your .emacs file if you always want to
+            run emacs as a server
+
+            > btv --no-xterm --exe emacsclient
+
+            will open all files in the running EMACS instance
+
+
+        GEDIT:
+
+            start up gedit like this:
+
+            > gedit
+
+            this program will open files in tabs if it
+            finds a running instance, or else it will start
+            one for you.
+
+            > btv --no-xterm --exe gedit
+
+            will open all files in running GEDIT instance
+        """
+        for line in self.howto.__doc__.split("\n"):
+            print line[7:]
+
+
+
+
+#______________________________________________________________________________#
+
+class SplashScreen(gtk.Window):
+
+    def __init__(self):
+
+        signal.signal(signal.SIGINT, self.ignore_ctrlc)
+        global _config
+    
+        gtk.Window.__init__(self)
+        self.set_type_hint(gtk.gdk.WINDOW_TYPE_HINT_SPLASHSCREEN)
+        self.set_position(gtk.WIN_POS_CENTER)
+
+        image = gtk.Image()
+
+        logo_generator = TreeGFX()
+
+        image.set_from_pixbuf(logo_generator.get_logo(_config['logo']))
+        image.set_padding(20, 20)
+        image.show()
+
+        self.add(image)
+
+    def ignore_ctrlc(self, sig, frame):
+        """ ignore Ctrl-C which raises a KeyboardInterrupt.."""
+        pass
+        
+
+#______________________________________________________________________________#
+
+# globals needed
+
+_tmpdir_  = None
+
+# defaults
+
+_config = {}
+_config['min_w'] = 210
+_config['min_h'] = 721
+_config['geometry'] = '98x42'
+_config['opendir'] = os.getcwd() # use curdir as default
+_config['title'] = 'btv'
+_config['recursive'] = True
+_config['executable'] = 'vim'
+_config['xterm'] = True
+_config['exe_args'] = ''
+_config['topdir'] = False
+_config['loglevel'] = ''
+_config['hidden'] = False
+_config['splash'] = True
+_config['logfile'] = sys.stderr
+_config['termargs'] = ''
+_config['altterm'] = ''
+_config['filter'] = []
+_config['numeric'] = False
+# fun
+_config['logo'] = "bruce"
+
+
+def _unlink_tmp():
+    """ unlinks temporary directories/sym's"""
+    global _tmpdir_
+    if(_tmpdir_):
+        for tmpfile in os.listdir(_tmpdir_):
+            os.unlink(_tmpdir_ + os.sep + tmpfile)
+        os.rmdir(_tmpdir_)
+        _tmpdir_ = None
+
+
+def are_you_sure():
+    """ 
+    lets user convert to -non-recursive mode
+    if he opens home directory in recursive mode...
+    """
+
+    global _config
+
+    home = os.environ['HOME']
+
+    explain_it= """
+    Build a <b>recursive</b> treeview of: %s?
+    """%(home)
+
+
+    if(home == _config['opendir'] and _config['recursive']):
+
+        dialog = gtk.MessageDialog(type=gtk.MESSAGE_WARNING)
+        
+        dialog.set_markup(explain_it)
+        dialog.add_buttons(gtk.STOCK_CANCEL, gtk.RESPONSE_CANCEL,
+                           gtk.STOCK_YES, gtk.RESPONSE_YES,
+                           gtk.STOCK_NO, gtk.RESPONSE_NO)
+
+        response = dialog.run()
+        if response == gtk.RESPONSE_NO:
+            _config['recursive'] = False
+        elif response == gtk.RESPONSE_CANCEL:
+            sys.exit(1)
+        else:
+            logging.warn("opening HOME recursively")
+        dialog.destroy()
+
+
+
+def init_main(splash):
+    """ 
+    create the main window of the application
+    """
+
+    t = TreeViewWindow()
+    t.show()
+    
+    if(splash):
+        splash.destroy()
+
+
+
+def init_parser():
+    """
+    this initializes the parser, and this has to be
+    done prior to the splash screen, since some
+    options like 'help' and so on don't really
+    need a splash :-)
+    """
+
+    # defaults are stored in _config 
+    global _config
+
+    # parse command line arguments
+    tree_option = TreeOptions()
+    tree_option.parse_rc()
+    tree_option.refill_defaults(_config) # first load .btvrc options
+    tree_option.parse_argv(sys.argv[1:])             
+    tree_option.refill_defaults(_config) # command line overrides .btvrc
+
+
+    # if user tries to open $HOME recursively this could typically
+    # take quite a while so i'll give him a warning and prompt him
+    # for a switch to 'non-recursive' mode
+    are_you_sure()
+
+    
+    # TODO: logging
+    fmt = []
+    fmt.append('%(levelname) -8s | file %(filename)s in')
+    fmt.append(' line %(lineno)4d on %(asctime)s \n>> %(message)s')
+    logging.basicConfig(level=logging.CRITICAL,
+                        format=''.join(fmt), 
+                        datefmt='%a, %d %b %Y %H:%M:%S', 
+                        file=_config['logfile'])
+
+
+
+    if(_config['splash']):
+        splash = SplashScreen()
+        splash.show()
+        gobject.idle_add(init_main, splash) 
+        gtk.main()
+
+    else:
+        init_main(None);
+        gtk.main()
+
+
+
+
+if __name__ == '__main__':
+    init_parser()
+
